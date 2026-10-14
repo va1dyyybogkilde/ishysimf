@@ -214,6 +214,91 @@ async def cmd_start_admin(message: types.Message, state: FSMContext) -> None:
     )
 
 
+# Республика кэша ссылки на канал для /myposts
+_channel_username: str | None = None
+
+
+async def _get_channel_username() -> str | None:
+    """Кэширует username канала, чтобы строить публичные ссылки на посты."""
+    global _channel_username
+    if _channel_username is None:
+        try:
+            chat = await bot.get_chat(config.CHANNEL_ID)
+            _channel_username = chat.username or ""
+        except TelegramAPIError:
+            _channel_username = ""
+    return _channel_username or None
+
+
+def _post_link(channel_username: str | None, msg_id: int) -> str:
+    """Ссылка на пост: публичная (t.me/username/id) или скрытая (t.me/c/id/id)."""
+    if channel_username:
+        return f"https://t.me/{channel_username}/{msg_id}"
+    clean = str(config.CHANNEL_ID)
+    if clean.startswith("-100"):
+        clean = clean[4:]
+    return f"https://t.me/c/{clean}/{msg_id}"
+
+
+# 1b. Команда /myposts — статус своих опубликованных постов
+@dp.message(Command("myposts", "my_posts"))
+async def cmd_my_posts(message: types.Message) -> None:
+    if not message.from_user or is_admin(message.from_user.id):
+        return
+
+    if db.is_user_blocked(message.from_user.id):
+        await message.answer("❌ Вы заблокированы в этом боте.")
+        return
+
+    posts = db.get_user_posts(message.from_user.id)
+    if not posts:
+        await message.answer(
+            "У вас пока нет опубликованных постов.\n\n"
+            "Пришлите текст или фото — после модерации он появится в канале, "
+            "а ссылка придёт сюда по команде /myposts."
+        )
+        return
+
+    channel_username = await _get_channel_username()
+    lines = []
+    for i, (channel_msg_id, post_text, created_at) in enumerate(posts, 1):
+        preview = (post_text or "[Медиафайл]").strip().replace("\n", " ")[:60]
+        try:
+            date_str = created_at.strftime("%d.%m.%Y %H:%M")
+        except AttributeError:
+            date_str = ""
+        link = _post_link(channel_username, channel_msg_id)
+        lines.append(
+            f"{i}. <b>{preview}…</b>\n"
+            f"   📅 {date_str}\n"
+            f"   🔗 <a href='{link}'>открыть пост</a>"
+        )
+
+    await message.answer(
+        f"<b>Ваши опубликованные посты ({len(posts)}):</b>\n\n" + "\n\n".join(lines),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+
+
+# 1c. Команда /help
+@dp.message(Command("help"))
+async def cmd_help(message: types.Message) -> None:
+    text = (
+        "📖 <b>Ищу тебя Симферополь</b> — бот для публикации объявлений о поиске людей.\n\n"
+        "📝 <b>Как оставить объявление:</b>\n"
+        "Просто пришлите сообщение (текст, фото или видео). Оно уйдёт модераторам, "
+        "и после проверки появится в нашем канале.\n\n"
+        "🔗 <b>Узнать свой пост:</b>\n"
+        "Команда /myposts покажет ваши опубликованные объявления и ссылки на них.\n\n"
+        "♻️ <b>Удалить пост:</b>\n"
+        "Напишите «удалить пост» — модератор найдёт его по вашей ссылке и уберёт из канала.\n\n"
+        "📌 <b>Правила:</b> без оскорблений, спама и личных данных третьих лиц. "
+        "За нарушения — блокировка."
+    )
+    await message.answer(text, parse_mode="HTML")
+
+
 # 2. Обработка кнопок админ-панели
 @dp.callback_query(F.data.startswith("admin_"))
 async def handle_admin_callbacks(callback: types.CallbackQuery, state: FSMContext) -> None:

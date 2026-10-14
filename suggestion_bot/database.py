@@ -185,3 +185,15 @@ def get_user_by_topic(topic_id: int) -> int | None:
             cur.execute("SELECT user_id FROM users WHERE topic_id = %s;", (topic_id,))
             row = cur.fetchone()
             return row[0] if row else None
+
+
+def get_user_posts(user_id: int) -> list[tuple]:
+    """Все опубликованные посты пользователя (свежие первыми)."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT channel_msg_id, post_text, created_at FROM posts "
+                "WHERE user_id = %s ORDER BY id DESC;",
+                (user_id,),
+            )
+            return cur.fetchall()

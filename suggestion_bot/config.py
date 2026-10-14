@@ -3,8 +3,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Токен бота от @BotFather
-BOT_TOKEN = os.getenv("BOT_TOKEN", "ВАШ_ТОКЕН_БОТА")
+# Токен бота от @BotFather (обязательно в env на Render / в .env локально)
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
 # ID супергруппы администрации (с включенными форумами/топиками)
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "-1001234567890"))
