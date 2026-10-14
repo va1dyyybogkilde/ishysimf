@@ -719,6 +719,7 @@ async def handle_admin_reply(message: types.Message) -> None:
 
 async def main() -> None:
     db.init_db()
+    await _health_check()
     await bot.delete_webhook(drop_pending_updates=True)
     print("Бот и веб-сервер успешно запущены!")
 
@@ -727,6 +728,38 @@ async def main() -> None:
         run_fastapi(),
         dp.start_polling(bot)
     )
+
+
+async def _health_check() -> None:
+    """Проверяет при старте, что бот имеет доступ к каналу и админ-группе."""
+    try:
+        me = await bot.get_me()
+        print(f"🤖 Бот: @{me.username}")
+    except TelegramAPIError as e:
+        print(f"❌ Не удалось получить информацию о боте: {e}")
+        return
+    for label, chat_id in (("админ-группа", config.ADMIN_CHAT_ID),
+                           ("канал", config.CHANNEL_ID)):
+        try:
+            chat = await bot.get_chat(chat_id)
+            ok = "✅" if chat.type in ("supergroup", "channel", "group") else "⚠️"
+            print(f"{ok} Доступ к {label} ({chat_id}): {chat.title}")
+        except TelegramAPIError as e:
+            print(f"❌ Нет доступа к {label} ({chat_id}). "
+                  f"Добавьте бота администратором и включите топики. {e}")
+    try:
+        topic = await bot.create_forum_topic(chat_id=config.ADMIN_CHAT_ID, name="health-check")
+        print("✅ Бот может создавать топики в админ-группе")
+        try:
+            await bot.delete_forum_topic(
+                chat_id=config.ADMIN_CHAT_ID,
+                message_thread_id=topic.message_thread_id,
+            )
+            print("   (тестовый топик удалён)")
+        except TelegramAPIError:
+            pass
+    except TelegramAPIError as e:
+        print(f"⚠️ Не удалось создать топик в админ-группе (убедитесь, что включены форумы): {e}")
 
 
 if __name__ == "__main__":
