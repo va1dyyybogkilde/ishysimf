@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import re
+import time
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.filters import Command
@@ -20,6 +21,41 @@ logging.basicConfig(level=logging.INFO)
 # Инициализация бота и диспетчера
 bot = Bot(token=config.BOT_TOKEN)
 dp = Dispatcher()
+
+# --- Временная память альбомов (media_group_id -> [ID сообщений в новой теме]) ---
+album_topics: dict[str, list[int]] = {}
+_album_timestamps: dict[str, float] = {}
+
+
+def _album_members_for(topic_msg_id: int) -> list[int] | None:
+    """Возвращает список ID сообщений альбома в топике, если найдена группа."""
+    for ids in album_topics.values():
+        if topic_msg_id in ids:
+            return ids
+    return None
+
+
+def _forget_album(topic_msg_id: int) -> None:
+    """Удаляет альбом из временной памяти по любому ID сообщения группы."""
+    for key, ids in list(album_topics.items()):
+        if topic_msg_id in ids:
+            album_topics.pop(key, None)
+            _album_timestamps.pop(key, None)
+            break
+
+
+def _prune_album_topics(limit: int = 300) -> None:
+    """Удаляет старые записи, чтобы память не росла бесконечно."""
+    if len(album_topics) <= limit:
+        return
+    now = time.monotonic()
+    for key in [k for k, t in _album_timestamps.items() if now - t > 6 * 3600]:
+        album_topics.pop(key, None)
+        _album_timestamps.pop(key, None)
+    while len(album_topics) > limit:
+        oldest = min(_album_timestamps, key=_album_timestamps.get)
+        album_topics.pop(oldest, None)
+        _album_timestamps.pop(oldest, None)
 
 # --- Настройка FastAPI для Web Service на Render ---
 app = FastAPI()
@@ -75,6 +111,15 @@ def get_post_action_keyboard(user_id: int) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="📢 Опубликовать пост", callback_data=f"pub_req:{user_id}"),
         InlineKeyboardButton(text="🚫 Заблокировать", callback_data=f"block_req:{user_id}")
     ]])
+
+
+def get_find_result_keyboard(channel_msg_id: int) -> InlineKeyboardMarkup:
+    """Клавиатура с действиями над найденным постом."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗑 Удалить пост из канала", callback_data=f"del_post:{channel_msg_id}")],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
+        [InlineKeyboardButton(text="❌ Закрыть меню", callback_data="admin_close")]
+    ])
 
 
 def get_pub_confirm_keyboard(user_id: int) -> InlineKeyboardMarkup:
@@ -282,7 +327,7 @@ async def process_find_input(message: types.Message, state: FSMContext) -> None:
         response,
         parse_mode="HTML",
         disable_web_page_preview=True,
-        reply_markup=get_admin_keyboard()
+        reply_markup=get_find_result_keyboard(channel_msg_id)
     )
 
 
@@ -336,13 +381,19 @@ async def handle_user_message(message: types.Message) -> None:
 
     kb = get_post_action_keyboard(message.from_user.id)
 
-    # Если это часть медиагруппы (альбома), Telegram шлет их пачкой.
     # Копируем сообщение в топик админ-чата вместе с клавиатурой управления под ним.
-    await message.copy_to(
+    copied = await message.copy_to(
         chat_id=config.ADMIN_CHAT_ID,
         message_thread_id=topic_id,
         reply_markup=kb
     )
+
+    # Если это часть медиагруппы (альбома) — запоминаем ID сообщения в топике,
+    # чтобы потом опубликовать весь альбом целиком (в aiogram нет getMediaGroup).
+    if message.media_group_id:
+        album_topics.setdefault(message.media_group_id, []).append(copied.message_id)
+        _album_timestamps[message.media_group_id] = time.monotonic()
+        _prune_album_topics()
 
     # Отправляем подтверждение пользователю только для первого сообщения из пачки
     # (чтобы не спамить «Ваше предложение отправлено» 5 раз, если прислали 5 фото)
@@ -385,36 +436,59 @@ async def publish_post_confirm(callback: types.CallbackQuery) -> None:
 
     original_text = source_msg.text or source_msg.caption or ""
     footer = getattr(config, "POST_FOOTER", "")
-    final_caption = f"{original_text}\n\n{footer}".strip() if footer else original_text.strip()
+    final_primary = f"{original_text}\n\n{footer}".strip() if footer else original_text.strip()
 
+    published_ids: list[int] = []
     try:
-        if source_msg.text:
-            published_msg = await bot.send_message(
-                chat_id=config.CHANNEL_ID,
-                text=final_caption,
-                parse_mode="HTML"
-            )
+        # Альбом: ищем записи альбома по ID сообщения, на которое нажали кнопку
+        album_members = _album_members_for(source_msg.message_id)
+        if album_members:
+            for i, mid in enumerate(album_members):
+                caption = final_primary if i == 0 else None
+                pm = await bot.copy_message(
+                    chat_id=config.CHANNEL_ID,
+                    from_chat_id=source_msg.chat.id,  # админ-чат, где лежит топик
+                    message_id=mid,
+                    caption=caption,
+                    parse_mode="HTML" if caption else None,
+                )
+                published_ids.append(pm.message_id)
+                if i < len(album_members) - 1:
+                    await asyncio.sleep(1.0)  # чтобы Telegram склеил сообщения в один альбом
         else:
-            published_msg = await bot.copy_message(
-                chat_id=config.CHANNEL_ID,
-                from_chat_id=source_msg.chat.id,
-                message_id=source_msg.message_id,
-                caption=final_caption,
-                parse_mode="HTML"
-            )
+            if source_msg.text:
+                pm = await bot.send_message(
+                    chat_id=config.CHANNEL_ID,
+                    text=final_primary,
+                    parse_mode="HTML",
+                )
+            else:
+                pm = await bot.copy_message(
+                    chat_id=config.CHANNEL_ID,
+                    from_chat_id=source_msg.chat.id,
+                    message_id=source_msg.message_id,
+                    caption=final_primary,
+                    parse_mode="HTML",
+                )
+            published_ids.append(pm.message_id)
+        # Чистим альбом из временной памяти (он уже опубликован и больше не нужен)
+        _forget_album(source_msg.message_id)
     except TelegramBadRequest as e:
         logging.error(f"Ошибка публикации поста: {e}")
         await callback.answer(
             "❌ Бот не смог опубликовать пост! Убедитесь, что бот добавлен в канал и имеет право 'Публикация сообщений'.",
-            show_alert=True
+            show_alert=True,
         )
         return
 
+    # Сохраняем в БД (первый ID храним в channel_msg_id — по нему строится ссылка,
+    # остальные ID альбома — для удаления всего альбома из канала)
     db.save_post(
-        channel_msg_id=published_msg.message_id,
+        channel_msg_id=published_ids[0],
         user_id=int(user_id),
         topic_id=source_msg.message_thread_id or 0,
-        post_text=original_text or "[Медиафайл]"
+        post_text=original_text or "[Медиафайл]",
+        media_ids=published_ids,
     )
 
     await callback.answer("Пост успешно опубликован!", show_alert=True)
@@ -487,6 +561,47 @@ async def unblock_user_callback(callback: types.CallbackQuery) -> None:
     await callback.answer("Пользователь разблокирован!", show_alert=True)
 
 
+# 12. Удаление поста из канала (вызывается из результатов поиска поста)
+@dp.callback_query(F.data.startswith("del_post:"))
+async def delete_post_callback(callback: types.CallbackQuery) -> None:
+    if not callback.from_user or not is_admin(callback.from_user.id):
+        await callback.answer("У вас нет прав администратора.", show_alert=True)
+        return
+
+    if not callback.data:
+        return
+
+    _, channel_msg_id_str = callback.data.split(":")
+    channel_msg_id = int(channel_msg_id_str)
+
+    # media_ids возвращается из БД для удаления всего альбома
+    media_ids = db.delete_post(channel_msg_id) or [channel_msg_id]
+
+    deleted_count = 0
+    for mid in media_ids:
+        try:
+            await bot.delete_message(chat_id=config.CHANNEL_ID, message_id=mid)
+            deleted_count += 1
+        except TelegramAPIError:
+            pass
+
+    if isinstance(callback.message, types.Message):
+        if deleted_count:
+            await callback.message.edit_text(
+                "🗑 Пост удалён из канала.",
+                reply_markup=get_admin_keyboard()
+            )
+        else:
+            await callback.message.edit_text(
+                "⚠️ Не удалось удалить пост (возможно, он уже удалён).",
+                reply_markup=get_admin_keyboard()
+            )
+    await callback.answer(
+        f"Удалено сообщений: {deleted_count}" if deleted_count else "Пост не найден в канале.",
+        show_alert=True
+    )
+
+
 # 11. Сброс действий (кнопка Отмена)
 @dp.callback_query(F.data.startswith("reset_actions:"))
 async def reset_actions_callback(callback: types.CallbackQuery) -> None:
@@ -503,7 +618,7 @@ async def reset_actions_callback(callback: types.CallbackQuery) -> None:
     await callback.answer("Действие отменено.")
 
 
-# 12. Отправка ответа администратора из темы автору
+# 13. Отправка ответа администратора из темы автору
 @dp.message(F.chat.id == config.ADMIN_CHAT_ID)
 async def handle_admin_reply(message: types.Message) -> None:
     if not message.message_thread_id or (message.text and message.text.startswith("/")):
