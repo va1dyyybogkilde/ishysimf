@@ -138,7 +138,7 @@ async def flush_album_group(mgid: str, user_id: int, topic_id: int) -> None:
 app = FastAPI()
 
 
-@app.route("/", methods=["GET", "HEAD"])
+@app.api_route("/", methods=["GET", "HEAD"])
 async def root():
     return {"status": "Bot is active and running 24/7!"}
 
