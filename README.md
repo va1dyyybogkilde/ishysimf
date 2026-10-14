@@ -19,18 +19,21 @@
 
 ## Деплой на Render (бесплатно)
 
+> ✅ **Уже развёрнуто**: сервис `ishysimf-bot` (https://ishysimf-bot.onrender.com), ветка `main`, авто-деплой включён. Ниже — как это сделать заново или повторить на другом аккаунте.
+
 ### 1. Создайте проект на Render
 
 1. https://render.com → New → Web Service
-2. Подключите GitHub репозиторий
+2. Подключите GitHub репозиторий (или вставьте URL `https://github.com/va1dyyybogkilde/ishysimf`)
 3. Settings:
    - **Name:** `ishysimf-bot`
    - **Region:** Frankfurt (или ближайший)
    - **Branch:** `main`
-   - **Root Directory:** (пусто)
+   - **Root Directory:** `suggestion_bot`
    - **Runtime:** `Python`
-   - **Build Command:** `pip install -r suggestion_bot/requirements.txt`
-   - **Start Command:** `cd suggestion_bot && python main.py`
+   - **Build Command:** `pip install -r requirements.txt`
+   - **Start Command:** `python main.py`
+   - **Instance Type:** Free
 
 ### 2. Переменные окружения
 
