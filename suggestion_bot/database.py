@@ -28,8 +28,13 @@ def init_db() -> None:
                     topic_name TEXT,
                     topic_id BIGINT,
                     is_blocked BOOLEAN DEFAULT FALSE,
+                    welcomed BOOLEAN DEFAULT FALSE,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
+            """)
+            # Для уже существующей таблицы — только добавляем колонку, данные не трогаем
+            cur.execute("""
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS welcomed BOOLEAN DEFAULT FALSE;
             """)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS posts (
@@ -80,6 +85,23 @@ def is_user_blocked(user_id: int) -> bool:
             cur.execute("SELECT is_blocked FROM users WHERE user_id = %s;", (user_id,))
             row = cur.fetchone()
             return bool(row[0]) if row else False
+
+
+def is_welcomed(user_id: int) -> bool:
+    """Получал ли пользователь уже приветственное уведомление."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT welcomed FROM users WHERE user_id = %s;", (user_id,))
+            row = cur.fetchone()
+            return bool(row[0]) if row else False
+
+
+def mark_welcomed(user_id: int) -> None:
+    """Пометить, что уведомление пользователю уже отправлено."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE users SET welcomed = TRUE WHERE user_id = %s;", (user_id,))
+        conn.commit()
 
 
 def block_user(user_id: int) -> None:

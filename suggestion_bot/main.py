@@ -22,40 +22,117 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=config.BOT_TOKEN)
 dp = Dispatcher()
 
-# --- Временная память альбомов (media_group_id -> [ID сообщений в новой теме]) ---
-album_topics: dict[str, list[int]] = {}
-_album_timestamps: dict[str, float] = {}
+# --- Коллажи (медиагруппы) — все фото в одном сообщении ---
+from aiogram.types import InputMediaAudio, InputMediaDocument, InputMediaPhoto, InputMediaVideo
+
+album_data: dict[str, dict] = {}  # media_group_id -> {"msgs": [оригиналы], "topic_ids": [], "ts": float}
+_album_flush_tasks: set[str] = set()
+
+FIRST_MESSAGE_NOTICE = (
+    "✅ <b>Ваше сообщение доставлено администратору.</b>\n\n"
+    "С этого момента этот чат работает как диалог: вы можете уточнять детали "
+    "или дополнять пост, а ответы модератора будут приходить прямо сюда.\n\n"
+    "📌 Если вы прислали пост — после проверки он появится в канале."
+)
 
 
-def _album_members_for(topic_msg_id: int) -> list[int] | None:
-    """Возвращает список ID сообщений альбома в топике, если найдена группа."""
-    for ids in album_topics.values():
-        if topic_msg_id in ids:
-            return ids
-    return None
-
-
-def _forget_album(topic_msg_id: int) -> None:
-    """Удаляет альбом из временной памяти по любому ID сообщения группы."""
-    for key, ids in list(album_topics.items()):
-        if topic_msg_id in ids:
-            album_topics.pop(key, None)
-            _album_timestamps.pop(key, None)
-            break
-
-
-def _prune_album_topics(limit: int = 300) -> None:
+def _prune_album_data(limit: int = 300) -> None:
     """Удаляет старые записи, чтобы память не росла бесконечно."""
-    if len(album_topics) <= limit:
+    if len(album_data) <= limit:
         return
     now = time.monotonic()
-    for key in [k for k, t in _album_timestamps.items() if now - t > 6 * 3600]:
-        album_topics.pop(key, None)
-        _album_timestamps.pop(key, None)
-    while len(album_topics) > limit:
-        oldest = min(_album_timestamps, key=_album_timestamps.get)
-        album_topics.pop(oldest, None)
-        _album_timestamps.pop(oldest, None)
+    for key in [k for k, d in album_data.items() if now - d.get("ts", 0) > 6 * 3600]:
+        album_data.pop(key, None)
+
+
+def _build_media_list(msgs, final_caption: str | None = None) -> list:
+    """Собирает InputMedia-объекты из оригинальных сообщений (для send_media_group)."""
+    media = []
+    for i, m in enumerate(msgs):
+        cap = final_caption if i == 0 else None
+        parse_mode = "HTML" if cap else None
+        if m.photo:
+            media.append(InputMediaPhoto(media=m.photo[-1].file_id, caption=cap, parse_mode=parse_mode))
+        elif m.video:
+            media.append(InputMediaVideo(media=m.video.file_id, caption=cap, parse_mode=parse_mode))
+        elif m.document:
+            media.append(InputMediaDocument(media=m.document.file_id, caption=cap, parse_mode=parse_mode))
+        elif m.audio:
+            media.append(InputMediaAudio(media=m.audio.file_id, caption=cap, parse_mode=parse_mode))
+    return media
+
+
+def get_album_action_keyboard(user_id: int, mgid: str) -> InlineKeyboardMarkup:
+    """Кнопки под коллажем в топике модератора."""
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="📢 Опубликовать коллаж", callback_data=f"pub_req:{user_id}:{mgid}"),
+        InlineKeyboardButton(text="🚫 Заблокировать", callback_data=f"block_req:{user_id}")
+    ]])
+
+
+def get_album_confirm_keyboard(user_id: int, mgid: str) -> InlineKeyboardMarkup:
+    """Кнопка подтверждения публикации коллажа."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚠️ Подтвердить публикацию!", callback_data=f"pub_confirm:{user_id}:{mgid}")],
+        [InlineKeyboardButton(text="↩ Отмена", callback_data=f"pub_cancel:{user_id}:{mgid}")]
+    ])
+
+
+async def _send_first_notice(user_id: int) -> None:
+    """Единожды шлём пользователю уведомление о режиме чата."""
+    if db.is_welcomed(user_id):
+        return
+    try:
+        await bot.send_message(chat_id=user_id, text=FIRST_MESSAGE_NOTICE)
+        db.mark_welcomed(user_id)
+    except TelegramAPIError:
+        pass
+
+
+async def flush_album_group(mgid: str, user_id: int, topic_id: int) -> None:
+    """Собирает все фото коллажа в одно сообщение и отправляет в топик модератора."""
+    await asyncio.sleep(1.2)  # ждём доставки всех фото группы
+    try:
+        entry = album_data.get(mgid)
+        _album_flush_tasks.discard(mgid)
+        if not entry or not entry.get("msgs"):
+            return
+        msgs = entry["msgs"]
+        media = list(_build_media_list(msgs))
+        if not media:
+            # не медиа-группа — просто переслать поштучно
+            for m in msgs:
+                try:
+                    await m.copy_to(chat_id=config.ADMIN_CHAT_ID, message_thread_id=topic_id,
+                                    reply_markup=get_post_action_keyboard(user_id))
+                except TelegramAPIError:
+                    pass
+            await _send_first_notice(user_id)
+            return
+        sent = await bot.send_media_group(
+            chat_id=config.ADMIN_CHAT_ID,
+            message_thread_id=topic_id,
+            media=media,
+        )
+        entry["topic_ids"] = [m.message_id for m in sent]
+        # Коллаж в топике теперь одно сообщение — под ним клавиатура модератора
+        await bot.send_message(
+            chat_id=config.ADMIN_CHAT_ID,
+            message_thread_id=topic_id,
+            text=f"📎 Коллаж ({len(sent)} элементов).",
+            reply_markup=get_album_action_keyboard(user_id, mgid),
+        )
+        await _send_first_notice(user_id)
+    except Exception as e:
+        logging.error(f"Ошибка отправки коллажа в топик: {e}")
+        _album_flush_tasks.discard(mgid)
+        for m in (album_data.pop(mgid, {}).get("msgs") or []):
+            try:
+                await m.copy_to(chat_id=config.ADMIN_CHAT_ID, message_thread_id=topic_id,
+                                reply_markup=get_post_action_keyboard(user_id))
+            except TelegramAPIError:
+                pass
+        await _send_first_notice(user_id)
 
 # --- Настройка FastAPI для Web Service на Render ---
 app = FastAPI()
@@ -463,31 +540,27 @@ async def handle_user_message(message: types.Message) -> None:
         await message.answer("⚠️ Не удалось связаться с администрацией. Проверьте настройки админ-чата.")
         return
 
-    kb = get_post_action_keyboard(message.from_user.id)
+    # Если это коллаж (медиагруппа) — буферизируем все фото и отправим одним сообщением
+    if message.media_group_id:
+        mgid = message.media_group_id
+        entry = album_data.get(mgid)
+        if not entry:
+            entry = {"msgs": [], "topic_ids": [], "ts": time.monotonic()}
+            album_data[mgid] = entry
+        entry["msgs"].append(message)
+        if mgid not in _album_flush_tasks:
+            _album_flush_tasks.add(mgid)
+            asyncio.create_task(flush_album_group(mgid, message.from_user.id, topic_id))
+        return
 
-    # Копируем сообщение в топик админ-чата вместе с клавиатурой управления под ним.
-    copied = await message.copy_to(
+    # Обычное сообщение: копируем в топик админ-чата
+    await message.copy_to(
         chat_id=config.ADMIN_CHAT_ID,
         message_thread_id=topic_id,
-        reply_markup=kb
+        reply_markup=get_post_action_keyboard(message.from_user.id)
     )
-
-    # Если это часть медиагруппы (альбома) — запоминаем ID сообщения в топике,
-    # чтобы потом опубликовать весь альбом целиком (в aiogram нет getMediaGroup).
-    if message.media_group_id:
-        album_topics.setdefault(message.media_group_id, []).append(copied.message_id)
-        _album_timestamps[message.media_group_id] = time.monotonic()
-        _prune_album_topics()
-
-    # Отправляем подтверждение пользователю только для первого сообщения из пачки
-    # (чтобы не спамить «Ваше предложение отправлено» 5 раз, если прислали 5 фото)
-    if not message.media_group_id:
-        await message.answer("Ваше предложение отправлено администрации!")
-    else:
-        # Для альбомов проверяем, отправляли ли мы уже уведомление этому пользователю недавно,
-        # либо отправляем один раз на группу (можно просто дублировать текст, но лучше мягко уведомить)
-        pass
-
+    # Единожды уведомляем пользователя о режиме чата
+    await _send_first_notice(message.from_user.id)
 
 # 6. Запрос на публикацию / замена клавиатуры на подтверждение
 @dp.callback_query(F.data.startswith("pub_req:"))
@@ -499,11 +572,14 @@ async def pub_request_callback(callback: types.CallbackQuery) -> None:
     if not callback.data:
         return
 
-    _, user_id_str = callback.data.split(":")
-    if isinstance(callback.message, types.Message):
-        await callback.message.edit_reply_markup(reply_markup=get_pub_confirm_keyboard(int(user_id_str)))
-    await callback.answer("Нажмите «Подтвердить публикацию!» еще раз.", show_alert=False)
+    parts = callback.data.split(":")
+    user_id = int(parts[1])
+    mgid = parts[2] if len(parts) > 2 else None
 
+    if isinstance(callback.message, types.Message):
+        kb = get_album_confirm_keyboard(user_id, mgid) if mgid else get_pub_confirm_keyboard(user_id)
+        await callback.message.edit_reply_markup(reply_markup=kb)
+    await callback.answer("Нажмите «Подтвердить публикацию!» еще раз.", show_alert=False)
 
 # 7. Подтвержденная публикация поста в канал
 @dp.callback_query(F.data.startswith("pub_confirm:"))
@@ -515,30 +591,33 @@ async def publish_post_confirm(callback: types.CallbackQuery) -> None:
     if not callback.data or not isinstance(callback.message, types.Message):
         return
 
-    _, user_id = callback.data.split(":")
+    parts = callback.data.split(":")
+    user_id = int(parts[1])
+    mgid = parts[2] if len(parts) > 2 else None
     source_msg = callback.message
 
     original_text = source_msg.text or source_msg.caption or ""
     footer = getattr(config, "POST_FOOTER", "")
-    final_primary = f"{original_text}\n\n{footer}".strip() if footer else original_text.strip()
+    final_primary = (f"{original_text}\n\n{footer}").strip() if footer else original_text.strip()
 
     published_ids: list[int] = []
     try:
-        # Альбом: ищем записи альбома по ID сообщения, на которое нажали кнопку
-        album_members = _album_members_for(source_msg.message_id)
-        if album_members:
-            for i, mid in enumerate(album_members):
-                caption = final_primary if i == 0 else None
-                pm = await bot.copy_message(
+        if mgid:
+            # Коллаж: собираем медиа из оригинальных сообщений и шлём ОДНИМ коллажем
+            entry = album_data.pop(mgid, {})
+            msgs = entry.get("msgs") or []
+            media = list(_build_media_list(msgs, final_primary))
+            if media:
+                sent = await bot.send_media_group(
                     chat_id=config.CHANNEL_ID,
-                    from_chat_id=source_msg.chat.id,  # админ-чат, где лежит топик
-                    message_id=mid,
-                    caption=caption,
-                    parse_mode="HTML" if caption else None,
+                    media=media,
                 )
-                published_ids.append(pm.message_id)
-                if i < len(album_members) - 1:
-                    await asyncio.sleep(1.0)  # чтобы Telegram склеил сообщения в один альбом
+                published_ids = [m.message_id for m in sent]
+            else:
+                # не медиа — копируем поштучно
+                for m in msgs:
+                    pm = await m.copy_to(chat_id=config.CHANNEL_ID)
+                    published_ids.append(pm.message_id)
         else:
             if source_msg.text:
                 pm = await bot.send_message(
@@ -555,8 +634,6 @@ async def publish_post_confirm(callback: types.CallbackQuery) -> None:
                     parse_mode="HTML",
                 )
             published_ids.append(pm.message_id)
-        # Чистим альбом из временной памяти (он уже опубликован и больше не нужен)
-        _forget_album(source_msg.message_id)
     except TelegramBadRequest as e:
         logging.error(f"Ошибка публикации поста: {e}")
         await callback.answer(
@@ -565,8 +642,7 @@ async def publish_post_confirm(callback: types.CallbackQuery) -> None:
         )
         return
 
-    # Сохраняем в БД (первый ID храним в channel_msg_id — по нему строится ссылка,
-    # остальные ID альбома — для удаления всего альбома из канала)
+    # Сохраняем в БД (первый ID — по нему строится ссылка, остальные — для удаления коллажа)
     db.save_post(
         channel_msg_id=published_ids[0],
         user_id=int(user_id),
@@ -582,6 +658,24 @@ async def publish_post_confirm(callback: types.CallbackQuery) -> None:
     ]])
     await callback.message.edit_reply_markup(reply_markup=published_kb)
 
+
+@dp.callback_query(F.data.startswith("pub_cancel:"))
+async def pub_cancel_callback(callback: types.CallbackQuery) -> None:
+    if not callback.from_user or not is_admin(callback.from_user.id):
+        await callback.answer("У вас нет прав администратора.", show_alert=True)
+        return
+
+    if not callback.data:
+        return
+
+    parts = callback.data.split(":")
+    user_id = int(parts[1])
+    mgid = parts[2] if len(parts) > 2 else None
+
+    if isinstance(callback.message, types.Message):
+        kb = get_album_action_keyboard(user_id, mgid) if mgid else get_post_action_keyboard(user_id)
+        await callback.message.edit_reply_markup(reply_markup=kb)
+    await callback.answer("Отменено")
 
 # 8. Запрос на блокировку / замена клавиатуры на подтверждение
 @dp.callback_query(F.data.startswith("block_req:"))
