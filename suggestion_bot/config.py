@@ -1,6 +1,10 @@
 import os
 from dotenv import load_dotenv
 
+# Ищем .env и в папке бота, и в корне проекта — чтобы работало из любого CWD
+_env_dir = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(_env_dir, ".env"))
+load_dotenv(os.path.join(_env_dir, "..", ".env"))
 load_dotenv()
 
 # Токен бота от @BotFather (обязательно в env на Render / в .env локально)
