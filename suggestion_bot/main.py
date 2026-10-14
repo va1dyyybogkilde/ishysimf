@@ -23,6 +23,7 @@ bot = Bot(token=config.BOT_TOKEN)
 dp = Dispatcher()
 
 # --- Коллажи (медиагруппы) — все фото в одном сообщении ---
+from aiogram import html as _html
 from aiogram.types import InputMediaAudio, InputMediaDocument, InputMediaPhoto, InputMediaVideo
 
 album_data: dict[str, dict] = {}  # media_group_id -> {"msgs": [оригиналы], "topic_ids": [], "ts": float}
@@ -45,11 +46,12 @@ def _prune_album_data(limit: int = 300) -> None:
         album_data.pop(key, None)
 
 
-def _build_media_list(msgs, final_caption: str | None = None) -> list:
-    """Собирает InputMedia-объекты из оригинальных сообщений (для send_media_group)."""
+def _build_media_list(msgs, caption_html: str | None = None) -> list:
+    """Собирает InputMedia-объекты из оригинальных сообщений (для send_media_group).
+    caption_html — подпись для первого элемента (уже экранированная, не raw-HTML юзера)."""
     media = []
     for i, m in enumerate(msgs):
-        cap = final_caption if i == 0 else None
+        cap = caption_html if i == 0 else None
         parse_mode = "HTML" if cap else None
         if m.photo:
             media.append(InputMediaPhoto(media=m.photo[-1].file_id, caption=cap, parse_mode=parse_mode))
@@ -98,7 +100,9 @@ async def flush_album_group(mgid: str, user_id: int, topic_id: int) -> None:
         if not entry or not entry.get("msgs"):
             return
         msgs = entry["msgs"]
-        media = list(_build_media_list(msgs))
+        user_text = (msgs[0].caption or "").strip() if msgs else ""
+        caption_html = _html.quote(user_text) if user_text else None
+        media = list(_build_media_list(msgs, caption_html))
         if not media:
             # не медиа-группа — просто переслать поштучно
             for m in msgs:
@@ -596,9 +600,17 @@ async def publish_post_confirm(callback: types.CallbackQuery) -> None:
     mgid = parts[2] if len(parts) > 2 else None
     source_msg = callback.message
 
-    original_text = source_msg.text or source_msg.caption or ""
     footer = getattr(config, "POST_FOOTER", "")
-    final_primary = (f"{original_text}\n\n{footer}").strip() if footer else original_text.strip()
+    album_msgs: list = []
+    if mgid and mgid in album_data:
+        album_msgs = album_data[mgid].get("msgs") or []
+    # Текст поста берём у пользователя (для коллажей — из закэшированных сообщений),
+    # а не с кнопки-подтверждения в топике модератора
+    user_text = (source_msg.text or source_msg.caption or "").strip()
+    if album_msgs:
+        user_text = (album_msgs[0].text or album_msgs[0].caption or "").strip()
+    user_text_html = _html.quote(user_text) if user_text else ""
+    final_primary = (f"{user_text_html}\n\n{footer}").strip() if footer else user_text_html
 
     published_ids: list[int] = []
     try:
@@ -647,7 +659,7 @@ async def publish_post_confirm(callback: types.CallbackQuery) -> None:
         channel_msg_id=published_ids[0],
         user_id=int(user_id),
         topic_id=source_msg.message_thread_id or 0,
-        post_text=original_text or "[Медиафайл]",
+        post_text=user_text or "[Медиафайл]",
         media_ids=published_ids,
     )
 
