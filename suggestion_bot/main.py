@@ -142,19 +142,23 @@ async def flush_album_group(mgid: str, user_id: int, topic_id: int) -> None:
 # --- Настройка FastAPI для Web Service на Render ---
 app = FastAPI()
 
+# Флаг: заведён ли Telegram-polling (ставится в main()). Если процесс жив,
+# но флаг false — значит поллер ещё не стартовал или упал.
+BOT_ALIVE = {"v": False}
+
 
 @app.api_route("/", methods=["GET", "HEAD"])
 @app.api_route("/health", methods=["GET", "HEAD"])
 async def root():
-    """Health-check: возвращает 200 только если БД доступна (SELECT 1)."""
+    """Health-check: DB (SELECT 1) + признак живучести Telegram-бота."""
     try:
         db_ok = db.ping()
     except Exception as e:
         logging.error(f"Health-check: ошибка БД: {e}")
         db_ok = False
-    if db_ok:
-        return {"status": "ok", "db": True}
-    return {"status": "degraded", "db": False}
+    bot_ok = bool(BOT_ALIVE["v"])
+    status = "ok" if (db_ok and bot_ok) else "degraded"
+    return {"status": status, "db": db_ok, "bot": bot_ok}
 
 
 
@@ -960,6 +964,7 @@ async def main() -> None:
     await bot.delete_webhook(drop_pending_updates=True)
     print("Бот и веб-сервер успешно запущены!")
 
+    BOT_ALIVE["v"] = True  # поллер сейчас будет запущен
     # Одновременный запуск FastAPI (для пингов), фонового отчёта и aiogram
     await asyncio.gather(
         run_fastapi(),
