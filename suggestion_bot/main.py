@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import time
+from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.filters import Command
@@ -143,8 +144,18 @@ app = FastAPI()
 
 
 @app.api_route("/", methods=["GET", "HEAD"])
+@app.api_route("/health", methods=["GET", "HEAD"])
 async def root():
-    return {"status": "Bot is active and running 24/7!"}
+    """Health-check: возвращает 200 только если БД доступна (SELECT 1)."""
+    try:
+        db_ok = db.ping()
+    except Exception as e:
+        logging.error(f"Health-check: ошибка БД: {e}")
+        db_ok = False
+    if db_ok:
+        return {"status": "ok", "db": True}
+    return {"status": "degraded", "db": False}
+
 
 
 async def run_fastapi():
@@ -155,12 +166,59 @@ async def run_fastapi():
     await server.serve()
 
 
+async def notify_admins(text: str) -> None:
+    """Отправляет важное уведомление всем администраторам (owner'ам и админам)."""
+    targets = config.ADMIN_IDS + [r[0] for r in db.get_admin_records()] if hasattr(db, "get_admin_records") else config.ADMIN_IDS
+    for uid in set(targets):
+        try:
+            await bot.send_message(chat_id=uid, text=text)
+        except Exception:
+            pass
+
+
+async def weekly_report() -> None:
+    """Раз в неделю шлёт статистику в админ-панель owner'ам."""
+    try:
+        while True:
+            now = datetime.now()
+            # ближайший понедельник 09:00
+            days_ahead = (0 - now.weekday()) % 7
+            if days_ahead == 0 and now.hour >= 9:
+                days_ahead = 7
+            next_run = (now + timedelta(days=days_ahead)).replace(
+                hour=9, minute=0, second=0, microsecond=0
+            )
+            await asyncio.sleep(max(5, (next_run - datetime.now()).total_seconds()))
+            try:
+                users_count, posts_count = db.get_stats()
+                await notify_admins(
+                    "📊 <b>Еженедельный отчёт</b>\n\n"
+                    f"👤 Пользователей: <b>{users_count}</b>\n"
+                    f"📝 Постов опубликовано: <b>{posts_count}</b>"
+                )
+            except Exception as e:
+                logging.error(f"Ошибка еженедельного отчёта: {e}")
+    except asyncio.CancelledError:
+        pass
+
+
 # --------------------------------------------------
 
 
 # Проверка прав администратора
+# - OWNER (config.OWNER_IDS): полные права, может управлять администраторами
+# - АДМИН (config.ADMIN_IDS или таблица admins в БД): модерирует, но НЕ добавляет админов
+def is_owner(user_id: int) -> bool:
+    return user_id in config.OWNER_IDS
+
+
 def is_admin(user_id: int) -> bool:
-    return user_id in config.ADMIN_IDS
+    if user_id in config.ADMIN_IDS:
+        return True
+    try:
+        return db.is_admin_user(user_id)
+    except Exception:
+        return False
 
 
 # FSM-состояния для админ-панели
@@ -524,6 +582,68 @@ async def process_broadcast_input(message: types.Message, state: FSMContext) -> 
     await message.answer("Панель управления:", reply_markup=get_admin_keyboard())
 
 
+# 4b. Управление администраторами (только для OWNER'ов)
+@dp.message(Command("add_admin"))
+async def cmd_add_admin(message: types.Message) -> None:
+    if not message.from_user or not is_owner(message.from_user.id):
+        await message.answer("❌ Только владелец может добавлять администраторов.")
+        return
+    parts = (message.text or "").strip().split()
+    if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
+        await message.answer("❗ Использование: /add_admin <user_id>")
+        return
+    new_id = int(parts[1])
+    if is_owner(new_id):
+        await message.answer("ℹ️ Этот пользователь уже владелец.")
+        return
+    if db.is_admin_user(new_id):
+        await message.answer("ℹ️ Этот пользователь уже администратор.")
+        return
+    db.add_admin(new_id, message.from_user.id)
+    await message.answer(f"✅ Администратор <code>{new_id}</code> добавлен.")
+    try:
+        await bot.send_message(
+            new_id,
+            "👋 Вас назначили администратором бота. Команды модерации доступны через /admin.",
+        )
+    except TelegramAPIError:
+        pass
+
+
+@dp.message(Command("remove_admin"))
+async def cmd_remove_admin(message: types.Message) -> None:
+    if not message.from_user or not is_owner(message.from_user.id):
+        await message.answer("❌ Только владелец может удалять администраторов.")
+        return
+    parts = (message.text or "").strip().split()
+    if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
+        await message.answer("❗ Использование: /remove_admin <user_id>")
+        return
+    target = int(parts[1])
+    if is_owner(target):
+        await message.answer("❌ Нельзя удалить владельца.")
+        return
+    if db.remove_admin(target):
+        await message.answer(f"✅ Администратор <code>{target}</code> удалён.")
+    else:
+        await message.answer("ℹ️ Этот пользователь не является администратором.")
+
+
+@dp.message(Command("admins"))
+async def cmd_list_admins(message: types.Message) -> None:
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+    lines = ["<b>👥 Администраторы:</b>\n"]
+    owners = config.OWNER_IDS
+    lines.append("— Владельцы: " + ", ".join(f"<code>{i}</code>" for i in owners))
+    records = db.get_admin_records()
+    if records:
+        lines.append("— Админы: " + ", ".join(f"<code>{r[0]}</code>" for r in records))
+    else:
+        lines.append("— Админы: нет")
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
 # 5. Прием предложений от пользователей в ЛС (с поддержкой медиа и альбомов)
 @dp.message(F.chat.type == "private")
 async def handle_user_message(message: types.Message) -> None:
@@ -822,15 +942,28 @@ async def handle_admin_reply(message: types.Message) -> None:
             await message.reply("Не удалось доставить сообщение (пользователь заблокировал бота).")
 
 
+# Глобальный обработчик ошибок: шлёт уведомление админам
+@dp.errors()
+async def global_error_handler(event) -> None:
+    exc = getattr(event, "exception", None) or getattr(event, "error", None)
+    if exc:
+        logging.error(f"Необработанная ошибка в обработчике: {exc!r}")
+        try:
+            await notify_admins(f"⚠️ <b>Ошибка в боте</b>\n<code>{exc!r}</code>")
+        except Exception:
+            pass
+
+
 async def main() -> None:
     db.init_db()
     await _health_check()
     await bot.delete_webhook(drop_pending_updates=True)
     print("Бот и веб-сервер успешно запущены!")
 
-    # Одновременный запуск FastAPI (для пингов) и aiogram (для бота)
+    # Одновременный запуск FastAPI (для пингов), фонового отчёта и aiogram
     await asyncio.gather(
         run_fastapi(),
+        weekly_report(),
         dp.start_polling(bot)
     )
 
