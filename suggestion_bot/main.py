@@ -206,6 +206,34 @@ async def weekly_report() -> None:
         pass
 
 
+async def daily_report() -> None:
+    """Раз в день (09:00) шлёт сводку активности в админ-чат."""
+    try:
+        while True:
+            now = datetime.now()
+            next_run = now.replace(hour=9, minute=0, second=0, microsecond=0)
+            if next_run <= now:
+                next_run += timedelta(days=1)
+            await asyncio.sleep(max(5, (next_run - datetime.now()).total_seconds()))
+            try:
+                since = datetime.now() - timedelta(hours=24)
+                new_users, new_posts, total_users, total_posts = db.get_daily_stats(since)
+                text = (
+                    "📅 <b>Сводка за сутки</b>\n\n"
+                    f"👤 Новых пользователей: <b>{new_users}</b>\n"
+                    f"📝 Новых постов: <b>{new_posts}</b>\n"
+                    f"➖ Всего: <b>{total_users}</b> юзеров, <b>{total_posts}</b> постов"
+                )
+                try:
+                    await bot.send_message(config.ADMIN_CHAT_ID, text, parse_mode="HTML")
+                except Exception as e:
+                    logging.error(f"Ошибка отправки дневной сводки: {e}")
+            except Exception as e:
+                logging.error(f"Ошибка дневной сводки: {e}")
+    except asyncio.CancelledError:
+        pass
+
+
 # --------------------------------------------------
 
 
@@ -648,6 +676,25 @@ async def cmd_list_admins(message: types.Message) -> None:
     await message.answer("\n".join(lines), parse_mode="HTML")
 
 
+@dp.message(Command("health"))
+async def cmd_health(message: types.Message) -> None:
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+    try:
+        db_ok = db.ping()
+    except Exception:
+        db_ok = False
+    bot_ok = bool(BOT_ALIVE["v"])
+    status = "✅ Всё работает" if (db_ok and bot_ok) else "⚠️ Есть проблемы"
+    lines = [
+        "<b>Health-check</b>\n",
+        f"• База PostgreSQL: {'✅ работает' if db_ok else '❌ НЕДОСТУПНА'}",
+        f"• Telegram-бот: {'✅ работает' if bot_ok else '❌ НЕ РАБОТАЕТ'}",
+        f"\n<b>Итог:</b> {status}",
+    ]
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
 # 5. Прием предложений от пользователей в ЛС (с поддержкой медиа и альбомов)
 @dp.message(F.chat.type == "private")
 async def handle_user_message(message: types.Message) -> None:
@@ -965,10 +1012,11 @@ async def main() -> None:
     print("Бот и веб-сервер успешно запущены!")
 
     BOT_ALIVE["v"] = True  # поллер сейчас будет запущен
-    # Одновременный запуск FastAPI (для пингов), фонового отчёта и aiogram
+    # Одновременный запуск FastAPI (для пингов), фоновых отчётов и aiogram
     await asyncio.gather(
         run_fastapi(),
         weekly_report(),
+        daily_report(),
         dp.start_polling(bot)
     )
 

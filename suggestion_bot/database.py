@@ -157,6 +157,24 @@ def get_stats() -> tuple[int, int]:
             return users_count, posts_count
 
 
+def get_daily_stats(since) -> tuple[int, int, int, int]:
+    """Статистика за период: (новых юзеров, новых постов, всего юзеров, всего постов).
+
+    `since` — datetime, с которого считать 'новых'.
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM users WHERE created_at >= %s", (since,))
+            new_users = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM posts WHERE created_at >= %s", (since,))
+            new_posts = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM users")
+            total_users = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM posts")
+            total_posts = cur.fetchone()[0]
+            return new_users, new_posts, total_users, total_posts
+
+
 def find_post_by_channel_msg_id(channel_msg_id: int) -> tuple | None:
     """Поиск поста по ID сообщения из канала."""
     with get_connection() as conn:
